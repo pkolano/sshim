@@ -1,0 +1,635 @@
+#!/usr/bin/perl
+#
+# Notices
+# Copyright (C) 2019 United States Government as represented by the
+# Administrator of the National Aeronautics and Space Administration.
+# All Rights Reserved.
+#
+# Disclaimers
+#
+# No Warranty: THE SUBJECT SOFTWARE IS PROVIDED "AS IS" WITHOUT ANY
+# WARRANTY OF ANY KIND, EITHER EXPRESSED, IMPLIED, OR STATUTORY,
+# INCLUDING, BUT NOT LIMITED TO, ANY WARRANTY THAT THE SUBJECT SOFTWARE
+# WILL CONFORM TO SPECIFICATIONS, ANY IMPLIED WARRANTIES OF
+# MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, OR FREEDOM FROM
+# INFRINGEMENT, ANY WARRANTY THAT THE SUBJECT SOFTWARE WILL BE ERROR FREE,
+# OR ANY WARRANTY THAT DOCUMENTATION, IF PROVIDED, WILL CONFORM TO THE
+# SUBJECT SOFTWARE. THIS AGREEMENT DOES NOT, IN ANY MANNER, CONSTITUTE AN
+# ENDORSEMENT BY GOVERNMENT AGENCY OR ANY PRIOR RECIPIENT OF ANY RESULTS,
+# RESULTING DESIGNS, HARDWARE, SOFTWARE PRODUCTS OR ANY OTHER APPLICATIONS
+# RESULTING FROM USE OF THE SUBJECT SOFTWARE. FURTHER, GOVERNMENT AGENCY
+# DISCLAIMS ALL WARRANTIES AND LIABILITIES REGARDING THIRD?PARTY SOFTWARE,
+# IF PRESENT IN THE ORIGINAL SOFTWARE, AND DISTRIBUTES IT "AS IS."
+#
+# Waiver and Indemnity: RECIPIENT AGREES TO WAIVE ANY AND ALL CLAIMS
+# AGAINST THE UNITED STATES GOVERNMENT, ITS CONTRACTORS AND
+# SUBCONTRACTORS, AS WELL AS ANY PRIOR RECIPIENT. IF RECIPIENT'S USE OF
+# THE SUBJECT SOFTWARE RESULTS IN ANY LIABILITIES, DEMANDS, DAMAGES,
+# EXPENSES OR LOSSES ARISING FROM SUCH USE, INCLUDING ANY DAMAGES FROM
+# PRODUCTS BASED ON, OR RESULTING FROM, RECIPIENT'S USE OF THE SUBJECT
+# SOFTWARE, RECIPIENT SHALL INDEMNIFY AND HOLD HARMLESS THE UNITED STATES
+# GOVERNMENT, ITS CONTRACTORS AND SUBCONTRACTORS, AS WELL AS ANY PRIOR
+# RECIPIENT, TO THE EXTENT PERMITTED BY LAW. RECIPIENT'S SOLE REMEDY FOR
+# ANY SUCH MATTER SHALL BE THE IMMEDIATE, UNILATERAL TERMINATION OF THIS
+# AGREEMENT.
+#
+
+# This program provides transparent resilience for ssh remote commands
+# provided it is installed on both the local and remote host and that
+# ssh batch mode authentication is being used (e.g. publickey or
+# hostbased).  A SSHIM session consists of three processes (all
+# implemented by this program):
+#   1. a local process sitting between the original command and ssh
+#   2. a remote process sitting between ssh and the remote SSHIM daemon
+#   3. a remote daemon sitting between the remote process and the remote
+#      side of the original command
+# There is only one instance of the local process and remote daemon,
+# but the remote process may be spawned as many times as needed to
+# overcome ssh connection interruptions.
+#
+# It is possible for remote daemons to be left running if the local
+# process is not allowed to terminate cleanly (e.g. kill -9 used).
+# It is also possible that the code experiences a failure scenario
+# on which it was not tested (none currently known, but inevitable
+# due to wide array of command/failure behavior - please report to
+# paul.kolano@nasa.gov if encountered).
+
+use strict;
+use File::Temp qw(tempdir);
+use Getopt::Long qw(:config bundling no_ignore_case require_order);
+use IO::Select;
+use IO::Socket::UNIX;
+use IPC::Open3;
+use List::Util qw(max min);
+use POSIX qw(setsid :sys_wait_h);
+use Symbol qw(gensym);
+
+our $VERSION = 1.0;
+
+use constant EOFFOE => "SSHIM_EOF" . "FOE_MIHSS";
+use constant EOFFOE_LEN => length(EOFFOE);
+# this is the max size of pipe reads/writes
+use constant IO_SIZE => 8192;
+use constant BUF_SIZE => 1024 * IO_SIZE;
+
+# 1 = local, 2 = remote, 3 = daemon
+my $self;
+
+my %opts = (
+    try => 0,
+    timeout => 10,
+);
+# these options (besides -h) are for internal use only
+die "Invalid options\n" if (!GetOptions(\%opts,
+    "help|h", "remote", "try=i", "sockdir=s",
+));
+if ($opts{help} || !scalar(@ARGV)) {
+    print "Usage: sshim ssh/dropbear [OPTION]... HOST COMMAND [ARGUMENT]...\n";
+    print "\n";
+    print "    - Provides transparent resilience for COMMAND on HOST\n";
+    print "    - Requires sshim in default \$PATH on HOST\n";
+    print "    - Requires batch mode authentication (e.g. publickey/hostbased)\n";
+    print "\n";
+    print "For use with scp/sftp, a simple wrapper must be created:\n";
+    print "\n";
+    print "    echo -e '#!/bin/sh\\nexec sshim ssh' > ~/bin/swrap\n";
+    print "    chmod 700 ~/bin/swrap\n";
+    print "\n";
+    print "Examples:\n";
+    print "\n";
+    print "    - rsync -e 'sshim ssh' -r /src/dir host.example.com:/dst/dir\n";
+    print "    - sshim ssh bastion.example.com ssh host.example.com cat /big/file\n";
+    print "    - scp -S ~/bin/swrap -r host.example.com:/src/dir /dst/dir\n";
+    print "    - sftp -S ~/bin/swrap -r host.example.com:/src/dir /dst/dir\n";
+    exit;
+}
+
+my $iargv;
+if (!$opts{remote} && $ARGV[0] =~ /(^|\/)(ssh|dropbear)$/) {
+    ###############
+    #### local ####
+    ###############
+    $self = 1;
+    my @save_args = @ARGV;
+    while ($ARGV[0] =~ /(^|\/)(ssh|dropbear)$/) {
+        # shift off ssh
+        shift @ARGV;
+        # find location of final remote command by parsing ssh options
+        GetOptions(
+	        qw(a f g k n q s t v x y),
+            qw(A C G K M N T V X Y),
+            qw(1 2 4 6),
+            qw(b=s c=s e=s i=s l=s m=s p=i w=s),
+            qw(D=s E=s F=s I=s J=s L=s O=s Q=s R=s S=s W=s),
+            "o=s" => sub {
+                # handle all -oKey=Val options of ssh
+                my ($key, $val) = split(/=|\s+/, $_[1]);
+                $val = shift @ARGV if (!defined $val);
+                $opts{$_[0] . lc($key)} = $val;
+            }
+        );
+        # shift off host name
+        shift @ARGV;
+    }
+    # insert sshim before final remote command
+    my @new = ("sshim", "--remote");
+    $iargv = -scalar(@ARGV);
+    splice(@save_args, $iargv, 0, @new);
+    @ARGV = @save_args;
+}
+
+my ($pid, $pipe, @child, @caller);
+my @rbytes = (0, 0, 0);
+my @bufs = ("", "", "");
+my @ibufs = (0, 0, 0);
+my @eof = (0, 0, 0);
+
+$SIG{PIPE} = sub {
+    $pipe = 1;
+};
+
+my @sock;
+my $sel = IO::Select->new;
+if ($opts{remote} && !$opts{sockdir}) {
+    ##############################
+    #### remote before daemon ####
+    ##############################
+    # print sockdir for client side
+    $opts{sockdir} = tempdir("sshim-XXXXXXXX", TMPDIR => 1);
+    my $nwrite = syswrite(STDOUT, $opts{sockdir} . "\n");
+    # write error so client will retry
+    exit if ($nwrite < length($opts{sockdir}) + 1);
+    local $SIG{ALRM} = sub {die};
+    alarm $opts{timeout};
+    # client must ack sockdir before spawning daemon
+    my $ok = read_oob(\*STDIN);
+    alarm 0;
+    # client did not receive sockdir so will retry
+    exit if ($ok ne 'OK');
+
+    ################
+    #### daemon ####
+    ################
+    if (!fork) {
+        $self = 3;
+        # detach process
+        close STDIN;
+        close STDOUT;
+        close STDERR;
+        setsid;
+        open(STDIN, "</dev/null");
+        open(STDOUT, ">/dev/null");
+        open(STDERR, ">/dev/null");
+        # create stdout/stderr sockets
+        foreach (1, 2) {
+    	    $sock[$_] = IO::Socket::UNIX->new(
+        	    Listen => 5,
+        	    Local => "$opts{sockdir}/sock.$_",
+        	    Proto => 'tcp',
+    	    );
+    	};
+        # temporarily forget sockdir to avoid some later processing
+        $opts{sockdir0} = $opts{sockdir};
+        delete $opts{sockdir};
+        $sel->add(@sock[1,2]);
+    }
+} else {
+    # socket should already exist 
+    $opts{timeout} = 0;
+}
+
+if (!$opts{sockdir}) {
+    if (!$opts{remote}) {
+        ###############
+        #### local ####
+        ###############
+        spawn_remote();
+    } else {
+        ################
+        #### daemon ####
+        ################
+        init_cmd();
+    }
+}
+
+if ($opts{sockdir}) {
+    ###############
+    #### local ####
+    ###############
+    ################
+    #### remote ####
+    ################
+    foreach my $fh (\*STDIN, \*STDOUT, \*STDERR) {
+        $fh->autoflush(1);
+        binmode $fh;
+    }
+    $sel->add(\*STDIN);
+    @caller = (\*STDIN, \*STDOUT, \*STDERR);
+}
+
+if ($opts{remote} && $opts{sockdir}) {
+    ################
+    #### remote ####
+    ################
+    $self = 2;
+    if ($opts{timeout}) {
+        # wait for daemon stderr socket to exist
+        eval {
+            local $SIG{ALRM} = sub {die};
+            alarm $opts{timeout};
+            sleep 1 while ($opts{timeout} && ! -S "$opts{sockdir}/sock.2");
+        };
+        alarm 0;
+    }
+    # connect to stderr socket first
+    foreach (2, 1) {
+        $child[$_] = IO::Socket::UNIX->new(
+            Peer => "$opts{sockdir}/sock.$_",
+        );
+    }
+    if (!defined $child[1] || !defined $child[2]) {
+        # can't connect to daemon so send eof to local and exit
+        my $rc = $caller[1]->syswrite("X\n");
+        exit;
+    }
+    # stdin/stdout use same bidirectional socket
+    $child[0] = $child[1];
+    init_child();
+    # associate sockets with this retry session
+    $child[1]->syswrite("$opts{try}\n");
+    $child[2]->syswrite("$opts{try}\n");
+}
+
+#TODO: catch C-c, etc. and shutdown
+
+# finacks required to exit
+my %ack = $self == 3 ? (1 => 1, 2 => 1) : ();
+my @fhs;
+#TODO: this loop busy waits when have writable data that cannot be
+#      written yet
+SELECT: while ((@fhs = $sel->can_read(.1)) ||
+        (max(map {length($bufs[$_]) - $ibufs[$_]} (0..2)) > 0) ||
+        ($self == 3 && (scalar(%ack) || !waitpid($pid, WNOHANG))) ||
+        ($self == 2 && -S "$opts{sockdir}/sock.1") ||
+        ($self == 1)) {
+    my $flush;
+    my $remove;
+    if (!scalar(@fhs)) {
+        # flush remaining buffer contents
+        foreach (0..2) {
+            push(@fhs, $_ ? $child[$_] : $caller[$_])
+                if (length($bufs[$_]) > $ibufs[$_]);
+        }
+        $flush = 1;
+    }
+    if ($self == 1 && !scalar(@fhs) && waitpid($pid, WNOHANG)) {
+        # remote has exited or died
+        last SELECT if (spawn_remote());
+    }
+#TODO: 3 has to detect that command has successfully exited
+    foreach my $fh (@fhs) {
+        # ignore if no longer an input
+        next if (!$flush && $remove && !$sel->exists($fh));
+        ################################
+        #### daemon socket handling ####
+        ################################
+        if ($fh == $sock[1]) {
+            # socket connect from remote to daemon (stdin/stdout)
+            my $sock = $fh->accept;
+            my $try = read_oob($sock);
+            if (!defined $try || $try < $opts{try}) {
+                # remote has connected out of order
+                #TODO: is something else needed here?
+                close $sock;
+                next;
+            }
+            $opts{try} = $try;
+            # remove previous remote 
+            if ($sel->exists($caller[0])) {
+                $sel->remove($caller[0]);
+                $remove = 1;
+            }
+            close $caller[0] if ($caller[0]);
+            $caller[0] = $sock;
+            $caller[1] = $sock;
+            $sel->add($caller[0]);
+            # send number of bytes daemon has read
+            my $rc = $caller[1]->syswrite($rbytes[0] . "\n");
+            #TODO: error handling on write
+            # read number of bytes read by remote
+            my $oob = read_oob($caller[0]);
+            if (!defined $oob) {
+                close $sock;
+                next;
+            }
+            my @nbytes = (0, split(/,/, $oob));
+            foreach my $i (1, 2) {
+                if ($nbytes[$i] < $rbytes[$i]) {
+                    # send the bytes that were never received by local
+                    $ibufs[$i] = length($bufs[$i]) - ($rbytes[$i] - $nbytes[$i]);
+                    if ($ibufs[$i] < 0) {
+                        #TODO: can't recover since don't have bytes anymore
+                    }
+                }
+            }
+            next;
+        } elsif ($fh == $sock[2]) {
+            # socket connect from remote to daemon (stderr)
+            my $sock = $fh->accept;
+            # read retry number
+            my $try = read_oob($sock);
+            if (!defined $try || $try < $opts{try}) {
+                # remote has connected out of order
+                #TODO: is something else needed here?
+                close $sock;
+            } else {
+                $opts{try} = $try;
+                # remove previous remote 
+                if ($sel->exists($caller[2])) {
+                    $sel->remove($caller[2]);
+                    $remove = 1;
+                }
+                close $caller[2] if ($caller[2]);
+                $caller[2] = $sock;
+                # add out-of-band channel to report stream 1/2 eof success
+                $sel->add($caller[2]);
+            }
+            next;
+        } elsif ($fh == $caller[2]) {
+            ################################
+            #### daemon finack handling ####
+            ################################
+            my $i = read_oob($fh);
+            if (!defined $i) {
+                # socket broken, so wait for respawn
+                if ($sel->exists($caller[0])) {
+                    $sel->remove($caller[0]);
+                    $remove = 1;
+                }
+                if ($sel->exists($caller[2])) {
+                    $sel->remove($caller[2]);
+                    $remove = 1;
+                }
+                close $caller[0] if ($caller[0]);
+                close $caller[2] if ($caller[2]);
+                next;
+            }
+            if ($i == 1 && $eof[0]) {
+                # close stream 0 as it could not be closed before finack
+                if ($sel->exists($caller[0])) {
+                    $sel->remove($caller[0]);
+                    $remove = 1;
+                }
+                close $caller[0];
+            }
+            delete $ack{$i};
+            if (!scalar(%ack)) {
+                # all finacks have been received so close stream 2 sock
+                if ($sel->exists($fh)) {
+                    $sel->remove($fh);
+                    $remove = 1;
+                }
+                close $fh;
+            }
+            next;
+        }
+        #################################
+        #### read from input channel ####
+        #################################
+        my $i = $fh == $caller[0] ? 0 : ($fh == $child[1] ? 1 : 2);
+        # do not read additional data if writer too far behind
+        $flush = 1 if (length($bufs[$i]) - $ibufs[$i] > BUF_SIZE);
+        my $nread;
+        $nread = $fh->sysread(my $buf, IO_SIZE) if (!$flush);
+        my $ofh = $i ? $caller[$i] : $child[$i];
+        $rbytes[$i] += $nread;
+        $bufs[$i] .= $buf;
+        if (!$eof[$i] && substr($bufs[$i], -EOFFOE_LEN()) eq EOFFOE) {
+            # eof marker has been received as final buffer content
+            $eof[$i] = 1;
+        }
+        if (defined $nread && $nread == 0) {
+            # end of stream
+            $sel->remove($fh);
+            $remove = 1;
+            if (!$flush && ($self == 3 && $i || $self == 1 && !$i)) {
+                # original non-sshim local/remote command
+                $eof[$i] = 1;
+                $bufs[$i] .= EOFFOE;
+                $rbytes[$i] += EOFFOE_LEN;
+                # do not close stderr sock since used for finack
+                close $fh if ($self != 3 || $i != 2 && $eof[0] && !$ack{1});
+            } elsif ($self == 1 && $i && !$eof[$i]) {
+                # respawn remote (ssh channel has likely been broken)
+                last SELECT if (spawn_remote());
+                next SELECT;
+            } elsif ($self == 2 && $i && !$eof[$i]) {
+                # 3 closed stream without eof so got connection from different 2
+                last SELECT;
+            }
+        }
+
+        #################################
+        #### write to output channel ####
+        #################################
+        if ($ofh && length($bufs[$i]) > $ibufs[$i]) {
+            # forward current buffer to corresponding output channel
+            my $size = $flush ? ~0 : IO_SIZE;
+            # do not forward eof to local/remote command
+#TODO: does this create termination problem elsewhere in code?
+#      i.e. can never write full buffer to 1:1/2 or 3:0
+            $size = min($size, length($bufs[$i]) - $ibufs[$i] - EOFFOE_LEN)
+                if ($eof[$i] && ($self == 1 && $i || $self == 3 && !$i));
+            my $nwrite = $ofh->syswrite(substr($bufs[$i], $ibufs[$i], $size));
+            if (!defined $nwrite) {
+                if ($self == 1 && $pipe && $i && !$eof[0]) {
+                    #TODO: at this point, 1/2 should be short-circuited since
+                    # nothing can or should be done and may take more resources
+                    # than normal (e.g. pipe to head)
+                    $pipe = 0;
+                    $eof[0] = 1;
+                    $bufs[0] .= EOFFOE;
+                    $rbytes[0] += EOFFOE_LEN;
+                    #TODO: this is never flushed out to 2/3
+                }
+                # remote socket or cmd broken, let local respawn remote
+                last SELECT if ($self == 2);
+                # unable to write to output channel
+                if ($self == 1 && $fh == $caller[0]) {
+                    # respawn remote (ssh channel has likely been broken)
+                    last SELECT if (spawn_remote());
+                    next SELECT;
+                } elsif ($self == 3) {
+                    if (!$eof[$i]) {
+                        # socket broken, so wait for respawn
+                        if ($sel->exists($caller[0])) {
+                            $sel->remove($caller[0]);
+                            $remove = 1;
+                        }
+                        if ($sel->exists($caller[2])) {
+                            $sel->remove($caller[2]);
+                            $remove = 1;
+                        }
+                        close $caller[0] if ($caller[0]);
+                        close $caller[2] if ($caller[2]);
+                    }
+                    # sleep to avoid busy wait on unforwardable but ready fh
+                    sleep 1;
+                }
+            }
+            # only save BUF_SIZE bytes in buffer
+            $ibufs[$i] += $nwrite;
+            $ibufs[$i] += EOFFOE_LEN
+                if ($eof[$i] && ($self == 1 && $i || $self == 3 && !$i));
+            if ($self == 2 && $i && $eof[$i] && $ibufs[$i] >= length($bufs[$i])) {
+                # send finack
+                $child[2]->syswrite("$i\n");
+            }
+            if ($self == 3 && $i == 0 && $eof[0] &&
+                    length($bufs[0]) - $ibufs[0] >= 0) {
+                close $child[0];
+            }
+            if (length($bufs[$i]) >= 3 * BUF_SIZE) {
+                # truncate buffer when grows too large
+                $bufs[$i] = substr($bufs[$i], BUF_SIZE());
+                if ($ibufs[$i] < BUF_SIZE) {
+                    #TODO: losing data - no way to recover
+                } else {
+                    $ibufs[$i] -= BUF_SIZE;
+                };
+            }
+        } elsif ($flush) {
+            # sleep to avoid busy wait on unforwardable but ready fh
+            sleep 1;
+        }
+
+        if (min(@eof) && min(map {length($bufs[$_]) - $ibufs[$_]} (0..2)) >= 0) {
+            # exit loop if eof received, no data to flush, and no acks left
+            last SELECT if (scalar(%ack) == 0);
+        }
+    }
+}
+#TODO: prevent final busy wait in error scenarios??
+
+if ($opts{sockdir0}) {
+    # clean up temporary files
+    foreach (1, 2) {
+        close $sock[$_];
+        unlink "$opts{sockdir0}/sock.$_";
+    }
+    rmdir $opts{sockdir0};
+}
+
+if ($pid) {
+    kill_child();
+    # exit code is meaningless because it's not the original cmd
+    exit;
+}
+
+####################
+#### kill_child ####
+####################
+sub kill_child {
+    return if (!$pid);
+    # killing via TERM can prevent child from flushing buffers
+    foreach my $fh (@child) {
+        close $fh;
+    }
+    #kill('TERM', $pid);
+    waitpid($pid, 0);
+}
+
+####################
+#### init_child ####
+####################
+sub init_child {
+    # set up child file handles
+    foreach my $fh (@child) {
+        $fh->autoflush(1);
+        binmode $fh;
+    }
+    $sel->add(@child[1,2]);
+}
+
+##################
+#### init_cmd ####
+##################
+sub init_cmd {
+    foreach my $fh (@child) {
+        $sel->remove($fh) if ($sel->exists($fh));
+    }
+    foreach my $fh (@child) {
+        close $fh;
+    }
+    my ($in, $out, $err);
+    $err = gensym;
+    # spawn given command
+    # stdin/out/err must not be closed or open3 has bug where handles do
+    # not function properly
+    $pid = open3($in, $out, $err, @ARGV);
+    #TODO: error handling
+    @child = ($in, $out, $err);
+    init_child();
+}
+
+##################
+#### read_oob ####
+##################
+sub read_oob {
+    my $fh = shift;
+    my ($c, $recv);
+    # read a character at a time until newline received
+    $recv .= $c while (sysread($fh, $c, 1) && ord($c) != 10);
+    return ord($c) == 10 ? $recv : undef;
+}
+
+######################
+#### spawn_remote ####
+######################
+sub spawn_remote {
+    # use --try option to prevent race conditions between multiple remotes
+    $opts{try}++;
+    if ($opts{try} == 1) {
+        splice(@ARGV, $iargv, 0, "--try=$opts{try}");
+    } else {
+        splice(@ARGV, $iargv - 1, 1, "--try=$opts{try}");
+    }
+    my $bytes;
+    my $retry = 5;
+    while ((!defined $opts{sockdir} || !defined $bytes) && $retry--) {
+        # spawn remote
+        kill_child();
+        #TODO: use timeout for connection?
+        init_cmd();
+        if (!$opts{sockdir}) {
+            # read sockdir
+            eval {
+                local $SIG{ALRM} = sub {die};
+                alarm $opts{timeout};
+                $opts{sockdir} = read_oob($child[1]);
+            };
+            alarm 0;
+            next if (!defined $opts{sockdir});
+            # all invocations of remote after first will use --sockdir option
+            splice(@ARGV, $iargv - 1, 0, "--sockdir=$opts{sockdir}")
+                if ($opts{sockdir});
+            # ack receipt of sockdir
+            $child[0]->syswrite("OK\n");
+        }
+        # send number of bytes local has read
+        my $oob = "$rbytes[1],$rbytes[2]\n";
+        my $nwrite = $child[0]->syswrite($oob);
+        $bytes = read_oob($child[1]) if ($nwrite == length($oob));
+        sleep 1 if (!defined $bytes);
+    }
+    return -1 if ($bytes eq 'X');
+    if ($bytes < $rbytes[0]) {
+        # send the bytes that were never received by daemon
+        $ibufs[0] = length($bufs[0]) - ($rbytes[0] - $bytes);
+        if ($ibufs[0] < 0) {
+            #TODO: can't recover since don't have bytes anymore
+        }
+    }
+    return 0;
+}
+
